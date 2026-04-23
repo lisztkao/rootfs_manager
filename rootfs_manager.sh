@@ -15,7 +15,7 @@
 #   sudo ./rootfs_manager.sh <command> <rootfs.img> [options...]
 #
 # Commands:
-#   install    <rootfs.img> <package.tar.gz> [mount_point]
+#   add-install    <rootfs.img> <package.tar.gz> [mount_point]
 #              Mount rootfs, extract tarball to /opt/installer, run install.sh
 #
 #   add-file   <rootfs.img> <src_path> <dest_path_in_rootfs> [mount_point]
@@ -35,6 +35,10 @@
 #              execute it in a chroot, then remove the staged file.
 #              Arguments after -- are passed verbatim to the installer.
 #
+#   add-edgeai-sdk <rootfs.img> <edgeai-sdk.tar.gz> [mount_point]
+#              Extract EdgeAI SDK tarball to /opt/Advantech/EdgeAI/ in rootfs,
+#              then copy EAS-Installer.desktop to /home/ubuntu/Desktop/
+#
 # =============================================================================
 # set -euo pipefail
 
@@ -51,22 +55,28 @@ die()     { error "$*"; exit 1; }
 # ── Usage ─────────────────────────────────────────────────────────────────────
 usage() {
     echo -e "${BOLD}Usage:${NC}"
-    echo "  sudo $0 install     <rootfs.img> <package.tar.gz> [mount_point]"
+    echo "  sudo $0 add-install     <rootfs.img> <package.tar.gz> [mount_point]"
     echo "  sudo $0 add-file    <rootfs.img> <src_path> <dest_path_in_rootfs> [mount_point]"
     echo "  sudo $0 add-module  <rootfs.img> <module.ko> [kernel_version] [mount_point]"
     echo "  sudo $0 add-service <rootfs.img> <service.service> [mount_point]"
     echo "  sudo $0 add-deb     <rootfs.img> <package.deb> [mount_point]"
     echo "  sudo $0 add-run     <rootfs.img> <installer.run> [mount_point] [-- <installer-args>...]"
+    echo "  sudo $0 add-edgeai-sdk <rootfs.img> <edgeai-sdk.tar.gz> [mount_point]"
+    echo "  sudo $0 add-susi <rootfs.img> <susi.tar.gz> [mount_point]"
+    echo "  sudo $0 add-weda <rootfs.img> <weda-installer.tgz> [mount_point]"
     echo "  sudo $0 remove-oeminfo-section     <rootfs.img> <section_key>"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  sudo $0 install     ubuntu.img myapp.tar.gz"
+    echo "  sudo $0 add-install     ubuntu.img myapp.tar.gz"
     echo "  sudo $0 add-file    ubuntu.img ./configs/99-custom.conf /etc/sysctl.d/99-custom.conf"
     echo "  sudo $0 add-module  ubuntu.img mydriver.ko 5.15.0-1023-nvidia"
     echo "  sudo $0 add-service ubuntu.img myapp.service"
     echo "  sudo $0 add-deb     ubuntu.img libfoo_1.0_arm64.deb"
     echo "  sudo $0 add-run     ubuntu.img cuda_12.3_installer.run"
     echo "  sudo $0 add-run     ubuntu.img cuda_12.3_installer.run /mnt/rootfs -- --silent --toolkit"
+    echo "  sudo $0 add-edgeai-sdk ubuntu.img EdgeAI-SDK.tar.gz"
+    echo "  sudo $0 add-susi    ubuntu.img Susi-SDK.tar.gz"
+    echo "  sudo $0 add-weda    ubuntu.img Weda-Installer.tgz"
     exit 1
 }
 
@@ -304,20 +314,99 @@ return 0
     fi
 }
 
-# =============================================================================
-# ── COMMAND: install ─────────────────────────────────────────────────────────
-#    Mount rootfs, extract tarball, execute install.sh inside chroot
-# =============================================================================
-cmd_install() {
-    [[ $# -ge 2 ]] || die "Usage: $0 install <rootfs.img> <package.tar.gz> [mount_point]"
+cmd_add_susi() {
+    cmd_add_install $1 $2 ""
+}
+
+cmd_add_weda() {
+    [[ $# -ge 2 ]] || die "Usage: $0 cmd_add_install <rootfs.img> <package.tar.gz> <user> [mount_point]"
     local tarball
-    tarball="$(realpath "$1")"
-    MOUNT_DIR="${2:-/mnt/ubuntu_rootfs}"
+    USER="$1"
+    tarball="$(realpath "$2")"
+    MOUNT_DIR="${3:-/mnt/ubuntu_rootfs}"
+
     [[ -f "$tarball" ]] || die "Tarball not found: $tarball"
 
     mount_rootfs_image "$ROOTFS_IMG"
 
-    if ! update_oeminfo "install" "$img_name"; then
+    if ! update_oeminfo "cmd_add_install" "$tarball"; then
+        success "Install already performed for this image. Exiting."
+        exit 0
+    fi
+
+    # ── Extract tarball ───────────────────────────────────────────────────────
+    local install_dir_in_chroot="/etc/weda_installer"
+    local install_dir_host="${MOUNT_DIR}${install_dir_in_chroot}"
+    info "Extracting tarball: $tarball → ${install_dir_in_chroot} (inside rootfs)"
+    [[ -d $install_dir_host ]] && rm -rf "$install_dir_host" >> /dev/null
+    mkdir -p "$install_dir_host"
+
+    local tar_flags="-xf"
+    case "$tarball" in
+        *.tar.gz|*.tgz)   tar_flags="-xzf" ;;
+        *.tar.bz2|*.tbz2) tar_flags="-xjf" ;;
+        *.tar.xz)          tar_flags="-xJf" ;;
+        *.tar.zst)         tar_flags="--zstd -xf" ;;
+        *.tar)             tar_flags="-xf"  ;;
+        *) warn "Unknown extension; letting tar auto-detect compression." ;;
+    esac
+    # shellcheck disable=SC2086
+    tar $tar_flags "$tarball" -C "$install_dir_host" --strip-components=0
+    success "Tarball extracted."
+
+    local install_script_host
+    install_script_host="$(find "$install_dir_host" -name install.sh)"
+    install_dir_in_chroot=$(dirname "${install_script_host/$MOUNT_DIR/}")
+    [[ -f "$install_script_host" ]] || \
+        die "install.sh not found inside tarball at ${install_dir_in_chroot}/install.sh"
+    chmod +x "$install_script_host"
+    info "Found and chmod +x install.sh"
+    info "install.sh path in chroot: ${install_dir_in_chroot}/install.sh"
+
+    # ── Run install.sh ────────────────────────────────────────────────────────
+    local clude_user_data_file="${MOUNT_DIR}/var/lib/cloud/seed/nocloud/user-data"
+    cat >> "$clude_user_data_file" << EOF
+# This works with most cloud images (AWS, Azure, GCP, etc.)
+runcmd:
+  # Get default user from cloud-init's distro
+  - |
+    DEFAULT_USER=\$(grep -oP '(?<=username: )\w+' /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null | head -1)
+    if [ -z "\$DEFAULT_USER" ]; then
+      DEFAULT_USER=${USER:-ubuntu}
+    fi
+    
+    cd '${install_dir_in_chroot}'
+    echo '1' | WEDA_TARGET_USER=\$DEFAULT_USER bash install.sh
+    sleep 1
+    rm -rf '${install_dir_in_chroot}'
+EOF
+   
+    local exit_code=$?
+    echo ""
+    [[ $exit_code -eq 0 ]] && success "install.sh completed successfully." \
+                             || { error "install.sh exited with code $exit_code."; exit $exit_code; }
+
+    # ── Cleanup installer files ───────────────────────────────────────────────
+    success "Installer files removed from rootfs."
+    success "All done."
+}
+
+
+# =============================================================================
+# ── COMMAND: install ─────────────────────────────────────────────────────────
+#    Mount rootfs, extract tarball, execute install.sh inside chroot
+# =============================================================================
+cmd_add_install() {
+    [[ $# -ge 2 ]] || die "Usage: $0 cmd_add_install <rootfs.img> <package.tar.gz> <user> [mount_point]"
+    local tarball
+    tarball="$(realpath "$1")"
+    USER="$2"
+    MOUNT_DIR="${3:-/mnt/ubuntu_rootfs}"
+    [[ -f "$tarball" ]] || die "Tarball not found: $tarball"
+
+    mount_rootfs_image "$ROOTFS_IMG"
+
+    if ! update_oeminfo "cmd_add_install" "$tarball"; then
         success "Install already performed for this image. Exiting."
         exit 0
     fi
@@ -326,6 +415,7 @@ cmd_install() {
     local install_dir_in_chroot="/opt/installer"
     local install_dir_host="${MOUNT_DIR}${install_dir_in_chroot}"
     info "Extracting tarball: $tarball → ${install_dir_in_chroot} (inside rootfs)"
+    [[ -d $install_dir_host ]] && rm -rf "$install_dir_host" >> /dev/null
     mkdir -p "$install_dir_host"
 
     local tar_flags="-xf"
@@ -352,12 +442,19 @@ cmd_install() {
     # ── Run install.sh ────────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}─── Running install.sh inside chroot ───${NC}"
+    local cmd_last="echo '1' | bash install.sh"
+    if [[ ! -z "$USER" ]]; then
+        info "user not empty"
+        cmd_last="echo '1' | WEDA_TARGET_USER=$USER bash install.sh"
+    fi
+    info "user: $USER"
     run_in_chroot "
         set -e
         echo '[chroot] Running: ${install_dir_in_chroot}/install.sh'
         cd '${install_dir_in_chroot}'
-        echo '1' | bash install.sh
+        eval '$cmd_last'
     "
+
     local exit_code=$?
     echo ""
     [[ $exit_code -eq 0 ]] && success "install.sh completed successfully." \
@@ -977,6 +1074,121 @@ cmd_add_run() {
 }
 
 # =============================================================================
+# ── cmd_add_edgeai_sdk: Extract EdgeAI SDK tarball and set up desktop launcher
+# =============================================================================
+#
+# Purpose:
+#    1. Extract EdgeAI SDK tar.gz file to /opt/Advantech/EdgeAI/ in rootfs
+#    2. Copy the desktop launcher file to /home/ubuntu/Desktop/EAS-Installer.desktop
+#
+# Usage:
+#    sudo ./rootfs_manager.sh add-edgeai-sdk <rootfs.img> <edgeai-sdk.tar.gz> [mount_point]
+#
+# Example:
+#    sudo ./rootfs_manager.sh add-edgeai-sdk ubuntu.img EdgeAI-SDK.tar.gz
+#
+# =============================================================================
+cmd_add_edgeai_sdk() {
+    [[ $# -ge 1 ]] || die "Usage: $0 add-edgeai-sdk <rootfs.img> <edgeai-sdk.tar.gz> [mount_point]"
+
+    local sdk_tarball mount_arg
+    local target_dir_edgeai="/opt/Advantech/EdgeAI"
+
+    # ── Parse positional arguments ────────────────────────────────────────────
+    sdk_tarball="$(realpath "$1")"; shift
+    [[ -f "$sdk_tarball" ]] || die "EdgeAI SDK tarball not found: $sdk_tarball"
+
+    # Validate that it's a tar.gz file
+    if [[ ! "$sdk_tarball" =~ \.tar\.gz$ ]]; then
+        die "File must be a .tar.gz archive: $sdk_tarball"
+    fi
+
+    # Check if next arg is a mount point (optional)
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        MOUNT_DIR="$1"; shift
+    else
+        MOUNT_DIR="/mnt/ubuntu_rootfs"
+    fi
+
+    local sdk_name
+    sdk_name="$(basename "$sdk_tarball")"
+
+    echo ""
+    echo -e "${BOLD}=== Adding EdgeAI SDK ===${NC}"
+    info "SDK tarball: $sdk_name"
+    echo ""
+
+    mount_rootfs_image "$ROOTFS_IMG"
+
+    # Record this operation in OEMInfo
+#    if ! update_oeminfo "add-edgeai-sdk" "$sdk_name"; then
+#        success "EdgeAI SDK installation already recorded. Skipping."
+#        exit 0
+#    fi
+
+    # ── Step 1: Create target directory ───────────────────────────────────────
+    local target_dir="${MOUNT_DIR}${target_dir_edgeai}"
+    info "Creating target directory: ${target_dir_edgeai}"
+    mkdir -p "$target_dir" || die "Failed to create directory: $target_dir"
+    success "Target directory created."
+    echo ""
+
+    # ── Step 2: Extract the tar.gz file ───────────────────────────────────────
+    info "Extracting EdgeAI SDK tarball …"
+    tar -xzf "$sdk_tarball" -C "$target_dir" \
+        || die "Failed to extract tarball: $sdk_tarball"
+    success "SDK extraction complete."
+    echo ""
+
+    # ── Step 3: Verify the desktop file exists ────────────────────────────────
+    local source_desktop="${target_dir}/Installer/script/EAS-Installer.desktop"
+    if [[ ! -f "$source_desktop" ]]; then
+        die "Desktop file not found at: ${source_desktop#"$MOUNT_DIR"}"
+    fi
+    info "Desktop file located: Installer/script/EAS-Installer.desktop"
+    echo ""
+
+    # Set correct ownership (ubuntu:ubuntu)
+    # chown 1000:1000 "$dest_desktop" 2>/dev/null || warn "Could not change ownership of desktop file"
+	info "Add permission of EdgeAI SDK installer .desktop file on Desktop"
+    local clude_user_data_file="${MOUNT_DIR}/var/lib/cloud/seed/nocloud/user-data"
+
+    cat >> "$clude_user_data_file" << 'EOF'
+# This works with most cloud images (AWS, Azure, GCP, etc.)
+runcmd:
+  # Get default user from cloud-init's distro
+  - |
+    DEFAULT_USER=$(grep -oP '(?<=username: )\w+' /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null | head -1)
+    if [ -z "$DEFAULT_USER" ]; then
+      DEFAULT_USER=$(getent passwd 1000 | cut -d: -f1)
+    fi
+    
+    # Create and set up desktop file
+    mkdir -p /home/$DEFAULT_USER/Desktop
+    chown -R $DEFAULT_USER:$DEFAULT_USER /home/$DEFAULT_USER/Desktop
+    chmod 755 /home/$DEFAULT_USER/Desktop
+
+    cp -a /opt/Advantech/EdgeAI/Installer/script/EAS-Installer.desktop /home/$DEFAULT_USER/Desktop
+    
+    # Set trusted metadata
+    sudo -u $DEFAULT_USER dbus-run-session -- gio set /home/$DEFAULT_USER/Desktop/EAS-Installer.desktop metadata::trusted true
+    update-desktop-database /home/$DEFAULT_USER/Desktop
+    chmod +x /home/$DEFAULT_USER/Desktop/EAS-Installer.desktop
+    
+EOF
+
+    success "Desktop file installed to: /home/ubuntu/Desktop/EAS-Installer.desktop"
+    echo ""
+
+    echo -e "${BOLD}─── Summary ───${NC}"
+    echo "✓ SDK extracted to: /opt/Advantech/EdgeAI/"
+    echo "✓ Desktop launcher at: /home/ubuntu/Desktop/EAS-Installer.desktop"
+    echo ""
+
+    success "add-edgeai-sdk completed successfully."
+}
+
+# =============================================================================
 # ── Command dispatcher ────────────────────────────────────────────────────────
 # =============================================================================
 echo ""
@@ -989,12 +1201,15 @@ echo ""
 shift 2
 
 case "$COMMAND" in
-    install)     cmd_install    "$@" ;;
+    add-install)     cmd_add_install    "$@" ;;
     add-file)    cmd_add_file   "$@" ;;
     add-module)  cmd_add_module "$@" ;;
     add-service) cmd_add_service "$@" ;;
     add-deb)     cmd_add_deb   "$@" ;;
     add-run)     cmd_add_run   "$@" ;;
+    add-edgeai-sdk) cmd_add_edgeai_sdk "$@" ;;
+    add-susi)   cmd_add_susi "$@" ;;
+    add-weda)   cmd_add_weda "$@" ;;
     remove-oeminfo-section) cmd_remove_oeminfo_section "$@" ;;
     *)
         error "Unknown command: $COMMAND"
